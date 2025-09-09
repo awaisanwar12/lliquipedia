@@ -82,6 +82,30 @@ class DatabaseService {
           score VARCHAR(50),
           match_date TIMESTAMP,
           tournament VARCHAR(255),
+          match_type VARCHAR(100),
+          status VARCHAR(50),
+          liquipedia_url TEXT,
+          raw_data JSONB,
+          created_at TIMESTAMP DEFAULT NOW(),
+          updated_at TIMESTAMP DEFAULT NOW()
+        );
+      `);
+
+      logger.info('Creating tournaments table...');
+      await this.pool.query(`
+        CREATE TABLE IF NOT EXISTS tournaments (
+          id SERIAL PRIMARY KEY,
+          liquipedia_id INTEGER,
+          name VARCHAR(500) NOT NULL,
+          game VARCHAR(100) NOT NULL,
+          tier VARCHAR(50),
+          prize_pool VARCHAR(100),
+          start_date TIMESTAMP,
+          end_date TIMESTAMP,
+          location VARCHAR(255),
+          organizer VARCHAR(255),
+          status VARCHAR(50),
+          category VARCHAR(100),
           liquipedia_url TEXT,
           raw_data JSONB,
           created_at TIMESTAMP DEFAULT NOW(),
@@ -112,6 +136,9 @@ class DatabaseService {
       await this.createIndexSafely('idx_matches_game', 'matches', 'game');
       await this.createIndexSafely('idx_matches_date', 'matches', 'match_date');
       await this.createIndexSafely('idx_matches_liquipedia_id', 'matches', 'liquipedia_id, game');
+      await this.createIndexSafely('idx_tournaments_game', 'tournaments', 'game');
+      await this.createIndexSafely('idx_tournaments_date', 'tournaments', 'start_date');
+      await this.createIndexSafely('idx_tournaments_liquipedia_id', 'tournaments', 'liquipedia_id, game');
       await this.createIndexSafely('idx_sync_log_type', 'sync_log', 'sync_type, game');
 
       logger.info('Adding unique constraints...');
@@ -119,6 +146,7 @@ class DatabaseService {
       await this.addConstraintSafely('teams', 'teams_liquipedia_game_unique', 'UNIQUE(liquipedia_id, game)');
       await this.addConstraintSafely('players', 'players_liquipedia_game_unique', 'UNIQUE(liquipedia_id, game)');
       await this.addConstraintSafely('matches', 'matches_liquipedia_game_unique', 'UNIQUE(liquipedia_id, game)');
+      await this.addConstraintSafely('tournaments', 'tournaments_liquipedia_game_unique', 'UNIQUE(liquipedia_id, game)');
       
       logger.info('Inserting default games...');
       // Insert default games
@@ -170,9 +198,19 @@ class DatabaseService {
 
   async addConstraintSafely(tableName, constraintName, constraint) {
     try {
-      await this.pool.query(`
-        ALTER TABLE ${tableName} ADD CONSTRAINT IF NOT EXISTS ${constraintName} ${constraint}
-      `);
+      // Check if constraint already exists
+      const existsQuery = `
+        SELECT constraint_name FROM information_schema.table_constraints 
+        WHERE table_name = $1 AND constraint_name = $2
+      `;
+      const exists = await this.pool.query(existsQuery, [tableName, constraintName]);
+      
+      if (exists.rows.length === 0) {
+        await this.pool.query(`ALTER TABLE ${tableName} ADD CONSTRAINT ${constraintName} ${constraint}`);
+        logger.info(`Added constraint ${constraintName} to ${tableName}`);
+      } else {
+        logger.info(`Constraint ${constraintName} already exists on ${tableName}`);
+      }
     } catch (error) {
       logger.warn(`Failed to add constraint ${constraintName}: ${error.message}`);
     }
@@ -280,6 +318,48 @@ class DatabaseService {
     }
   }
 
+  async upsertTournaments(tournaments) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      let processed = 0;
+
+      for (const tournament of tournaments) {
+        await client.query(`
+          INSERT INTO tournaments (liquipedia_id, name, game, category, status, liquipedia_url, raw_data, updated_at)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+          ON CONFLICT (liquipedia_id, game) 
+          DO UPDATE SET 
+            name = EXCLUDED.name,
+            category = EXCLUDED.category,
+            status = EXCLUDED.status,
+            liquipedia_url = EXCLUDED.liquipedia_url,
+            raw_data = EXCLUDED.raw_data,
+            updated_at = NOW()
+        `, [
+          tournament.id,
+          tournament.name,
+          tournament.game,
+          tournament.category || 'unknown',
+          tournament.status || 'unknown',
+          tournament.liquipedia_url,
+          JSON.stringify(tournament)
+        ]);
+        processed++;
+      }
+
+      await client.query('COMMIT');
+      logger.info(`Upserted ${processed} tournaments`);
+      return processed;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      logger.error('Failed to upsert tournaments', error);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async logSync(syncType, game, status, recordsProcessed = 0, errorMessage = null) {
     try {
       const result = await this.pool.query(`
@@ -324,6 +404,16 @@ class DatabaseService {
     return result.rows;
   }
 
+  async getTournaments(game = null, limit = 100) {
+    const query = game 
+      ? 'SELECT * FROM tournaments WHERE game = $1 ORDER BY start_date DESC, updated_at DESC LIMIT $2'
+      : 'SELECT * FROM tournaments ORDER BY start_date DESC, updated_at DESC LIMIT $1';
+    
+    const params = game ? [game, limit] : [limit];
+    const result = await this.pool.query(query, params);
+    return result.rows;
+  }
+
   async getSyncHistory(limit = 50) {
     const result = await this.pool.query(`
       SELECT * FROM sync_log 
@@ -331,6 +421,33 @@ class DatabaseService {
       LIMIT $1
     `, [limit]);
     return result.rows;
+  }
+
+  // Get comprehensive stats
+  async getStats(game = null) {
+    const gameCondition = game ? 'WHERE game = $1' : '';
+    const params = game ? [game] : [];
+
+    const teamsQuery = `SELECT COUNT(*) as count FROM teams ${gameCondition}`;
+    const playersQuery = `SELECT COUNT(*) as count FROM players ${gameCondition}`;
+    const matchesQuery = `SELECT COUNT(*) as count FROM matches ${gameCondition}`;
+    const tournamentsQuery = `SELECT COUNT(*) as count FROM tournaments ${gameCondition}`;
+
+    const [teamsResult, playersResult, matchesResult, tournamentsResult] = await Promise.all([
+      this.pool.query(teamsQuery, params),
+      this.pool.query(playersQuery, params),
+      this.pool.query(matchesQuery, params),
+      this.pool.query(tournamentsQuery, params)
+    ]);
+
+    return {
+      teams: parseInt(teamsResult.rows[0].count),
+      players: parseInt(playersResult.rows[0].count),
+      matches: parseInt(matchesResult.rows[0].count),
+      tournaments: parseInt(tournamentsResult.rows[0].count),
+      game: game || 'all',
+      timestamp: new Date().toISOString()
+    };
   }
 }
 

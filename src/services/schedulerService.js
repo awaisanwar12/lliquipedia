@@ -1,4 +1,3 @@
-const cron = require('node-cron');
 const LiquipediaService = require('./liquipediaService');
 const DatabaseService = require('./databaseService');
 const winston = require('winston');
@@ -261,75 +260,10 @@ class SchedulerService {
     }
   }
 
-  // Start all scheduled jobs - VERY CONSERVATIVE to avoid rate limiting
-  startScheduler() {
-    logger.info('Starting CONSERVATIVE scheduler service');
-
-    // MUCH more conservative scheduling to respect Liquipedia
-    
-    // Sync teams every 12 hours (instead of 4)
-    cron.schedule('0 */12 * * *', async () => {
-      logger.info('Running scheduled teams sync');
-      await this.syncTeams();
-    });
-
-    // Sync players every 12 hours (instead of 6) 
-    cron.schedule('30 */12 * * *', async () => {
-      logger.info('Running scheduled players sync');
-      await this.syncPlayers();
-    });
-
-    // Sync matches every 4 hours (instead of 30 minutes)
-    cron.schedule('0 */4 * * *', async () => {
-      logger.info('Running scheduled matches sync');
-      await this.syncMatches();
-    });
-
-    // Sync tournaments once daily
-    cron.schedule('0 6 * * *', async () => {
-      logger.info('Running scheduled tournaments sync');
-      await this.syncTournaments();
-    });
-
-    // Detailed matches sync twice daily
-    cron.schedule('0 10,22 * * *', async () => {
-      logger.info('Running scheduled detailed matches sync');
-      await this.syncDetailedMatches();
-    });
-
-    // Tournament results sync once daily
-    cron.schedule('0 14 * * *', async () => {
-      logger.info('Running scheduled tournament results sync');
-      await this.syncTournamentResults();
-    });
-
-    // Full sync once weekly on Sunday at 3 AM (instead of daily)
-    cron.schedule('0 3 * * 0', async () => {
-      logger.info('Running scheduled full sync');
-      await this.fullSync();
-    });
-
-    logger.info('Conservative scheduler started with the following jobs:');
-    logger.info('- Teams sync: every 12 hours');
-    logger.info('- Players sync: every 12 hours (offset 30 min)');
-    logger.info('- Matches sync: every 4 hours');
-    logger.info('- Tournaments sync: daily at 6 AM');
-    logger.info('- Detailed matches sync: twice daily (10 AM, 10 PM)');
-    logger.info('- Tournament results sync: daily at 2 PM');
-    logger.info('- Full sync: weekly on Sunday at 3 AM');
-  }
-
-  // Stop all scheduled jobs
-  stopScheduler() {
-    cron.destroy();
-    logger.info('Scheduler stopped');
-  }
-
   // Get current sync status
   getSyncStatus() {
     return {
       isRunning: { ...this.isRunning },
-      scheduledJobs: cron.getTasks().size,
       timestamp: new Date().toISOString()
     };
   }

@@ -743,49 +743,219 @@ class LiquipediaService {
     logger.info(`Fetching tournament details for ${tournamentName} (30s rate limit)`);
     
     try {
-      const data = await this.makeRequest(`https://liquipedia.net/${game}/api.php`, {
-        action: 'parse',
-        format: 'json',
-        page: tournamentName,
-        prop: 'wikitext|categories'
-      }, 0, 'intensive'); // Use intensive rate limiter (30 seconds)
+      // Try different tournament name variations
+      const tournamentVariations = [
+        tournamentName,
+        tournamentName.replace(/Season \d+/, '').trim(),
+        tournamentName.replace(/Series \d+/, '').trim(),
+        tournamentName.replace(/\d+/, '').trim(),
+        tournamentName.split(' ').slice(0, -2).join(' '), // Remove last 2 words
+        tournamentName.split(' ').slice(0, -1).join(' ')  // Remove last word
+      ];
 
-      if (data.parse && data.parse.wikitext) {
-        const wikitext = data.parse.wikitext['*'];
-        const categories = data.parse.categories || [];
+      for (const variation of tournamentVariations) {
+        if (!variation) continue;
         
-        return {
-          wikitext: wikitext.substring(0, 1000), // Truncate for storage
-          categories: categories.map(cat => cat['*']),
-          parsed_data: this.parseTournamentWikitext(wikitext, game),
-          fetched_at: new Date().toISOString()
-        };
+        logger.info(`Trying tournament variation: ${variation}`);
+        
+        // Get both wikitext AND HTML content for better parsing
+        const [wikitextData, htmlData] = await Promise.all([
+          this.makeRequest(`https://liquipedia.net/${game}/api.php`, {
+            action: 'parse',
+            format: 'json',
+            page: variation,
+            prop: 'wikitext|categories'
+          }, 0, 'intensive'),
+          this.makeRequest(`https://liquipedia.net/${game}/api.php`, {
+            action: 'parse',
+            format: 'json',
+            page: variation,
+            prop: 'text|categories'
+          }, 0, 'intensive')
+        ]);
+
+        if (wikitextData.parse && wikitextData.parse.wikitext) {
+          const wikitext = wikitextData.parse.wikitext['*'];
+          const htmlContent = htmlData.parse ? htmlData.parse.text['*'] : null;
+          const categories = wikitextData.parse.categories || [];
+          
+          logger.info(`Found tournament with variation: ${variation}`);
+          
+          // Parse both wikitext and HTML for comprehensive data
+          const parsedData = this.parseTournamentWikitext(wikitext, game);
+          
+          // If HTML is available, extract additional bracket data
+          if (htmlContent) {
+            this.extractDataFromHTML(htmlContent, parsedData);
+          }
+          
+          return {
+            found_name: variation,
+            original_name: tournamentName,
+            wikitext: wikitext.substring(0, 2000), // Increased for more data
+            html_snippet: htmlContent ? htmlContent.substring(0, 1000) : null,
+            categories: categories.map(cat => cat['*']),
+            parsed_data: parsedData,
+            fetched_at: new Date().toISOString()
+          };
+        }
+        
+        // Small delay between attempts
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
       
-      return null;
+      // If no variations worked, try searching
+      logger.info(`No direct match found, trying search for: ${tournamentName}`);
+      return await this.searchForTournament(tournamentName, game);
+      
     } catch (error) {
       logger.error(`Failed to fetch tournament details for ${tournamentName}`, error);
       return null;
     }
   }
 
-  // NEW: Parse tournament wikitext for results and brackets
+  // NEW: Extract additional data from HTML content
+  extractDataFromHTML(htmlContent, parsedData) {
+    try {
+      // Extract team names from HTML table cells and spans
+      const teamRegex = /<(?:td|span)[^>]*class="[^"]*team[^"]*"[^>]*>([^<]+)</gi;
+      let teamMatch;
+      const htmlTeams = [];
+      
+      while ((teamMatch = teamRegex.exec(htmlContent)) !== null) {
+        const teamName = teamMatch[1].trim();
+        if (teamName && teamName !== 'TBD' && teamName.length > 1) {
+          htmlTeams.push(teamName);
+        }
+      }
+      
+      // Add HTML-extracted teams to participants
+      if (htmlTeams.length > 0) {
+        parsedData.participants.push(...htmlTeams);
+        parsedData.participants = [...new Set(parsedData.participants)]; // Remove duplicates
+        logger.info(`Extracted ${htmlTeams.length} additional teams from HTML`);
+      }
+
+      // Extract match scores from HTML
+      const scoreRegex = /<(?:td|span)[^>]*class="[^"]*score[^"]*"[^>]*>(\d+-\d+)</gi;
+      let scoreMatch;
+      const htmlScores = [];
+      
+      while ((scoreMatch = scoreRegex.exec(htmlContent)) !== null) {
+        htmlScores.push(scoreMatch[1]);
+      }
+      
+      if (htmlScores.length > 0) {
+        logger.info(`Extracted ${htmlScores.length} match scores from HTML`);
+        // Add scores to existing matches or create new match entries
+        htmlScores.forEach((score, index) => {
+          if (parsedData.matches[index]) {
+            parsedData.matches[index].html_score = score;
+          } else {
+            parsedData.matches.push({
+              match_id: index + 1,
+              score: score,
+              source: 'html',
+              status: 'completed'
+            });
+          }
+        });
+      }
+
+    } catch (error) {
+      logger.warn('Error extracting data from HTML', error);
+    }
+  }
+
+  // NEW: Search for tournament if direct lookup fails
+  async searchForTournament(tournamentName, game) {
+    try {
+      const searchTerms = tournamentName.split(' ').filter(term => term.length > 2);
+      const searchQuery = searchTerms.join(' ');
+      
+      logger.info(`Searching for tournament with query: ${searchQuery}`);
+      
+      const data = await this.makeRequest(`https://liquipedia.net/${game}/api.php`, {
+        action: 'query',
+        format: 'json',
+        list: 'search',
+        srsearch: searchQuery,
+        srnamespace: 0,
+        srlimit: 10
+      });
+
+      const searchResults = data.query?.search || [];
+      
+      // Look for tournament-like pages
+      for (const result of searchResults) {
+        const title = result.title.toLowerCase();
+        const originalLower = tournamentName.toLowerCase();
+        
+        // Check if this looks like our tournament
+        if (title.includes('cct') && title.includes('oceania') && originalLower.includes('cct') && originalLower.includes('oceania')) {
+          logger.info(`Found potential match: ${result.title}`);
+          
+          // Try to fetch this tournament
+          const tournamentData = await this.makeRequest(`https://liquipedia.net/${game}/api.php`, {
+            action: 'parse',
+            format: 'json',
+            page: result.title,
+            prop: 'wikitext|categories'
+          }, 0, 'intensive');
+
+          if (tournamentData.parse && tournamentData.parse.wikitext) {
+            const wikitext = tournamentData.parse.wikitext['*'];
+            const categories = tournamentData.parse.categories || [];
+            
+            return {
+              found_name: result.title,
+              original_name: tournamentName,
+              search_match: true,
+              wikitext: wikitext.substring(0, 1000),
+              categories: categories.map(cat => cat['*']),
+              parsed_data: this.parseTournamentWikitext(wikitext, game),
+              fetched_at: new Date().toISOString()
+            };
+          }
+        }
+      }
+      
+      logger.warn(`No tournament found for search query: ${searchQuery}`);
+      return null;
+      
+    } catch (error) {
+      logger.error(`Failed to search for tournament ${tournamentName}`, error);
+      return null;
+    }
+  }
+
+  // NEW: Parse tournament wikitext for results and brackets - IMPROVED
   parseTournamentWikitext(wikitext, game) {
     const tournamentData = {
       prize_pool: null,
       participants: [],
       results: [],
+      matches: [],
+      brackets: {
+        upper_bracket: [],
+        lower_bracket: [],
+        grand_final: null
+      },
       dates: {
         start: null,
         end: null
       },
       location: null,
-      game: game
+      organizer: null,
+      sponsors: [],
+      game: game,
+      tier: null,
+      team_number: null
     };
 
     try {
-      // Extract prize pool
-      const prizeMatch = wikitext.match(/\|\s*prize\s*=\s*([^\n|]+)/i);
+      // Extract prize pool (multiple formats)
+      const prizeMatch = wikitext.match(/\|\s*prizepool\s*=\s*([^\n|]+)/i);
       if (prizeMatch) {
         tournamentData.prize_pool = prizeMatch[1].trim();
       }
@@ -796,17 +966,58 @@ class LiquipediaService {
       if (startDateMatch) tournamentData.dates.start = startDateMatch[1].trim();
       if (endDateMatch) tournamentData.dates.end = endDateMatch[1].trim();
 
-      // Extract location
-      const locationMatch = wikitext.match(/\|\s*location\s*=\s*([^\n|]+)/i);
+      // Extract location/country
+      const locationMatch = wikitext.match(/\|\s*country\s*=\s*([^\n|]+)/i);
       if (locationMatch) {
         tournamentData.location = locationMatch[1].trim();
       }
 
-      // Extract team results (simplified)
+      // Extract organizer
+      const organizerMatch = wikitext.match(/\|\s*organizer\s*=\s*([^\n|]+)/i);
+      if (organizerMatch) {
+        tournamentData.organizer = organizerMatch[1].trim();
+      }
+
+      // Extract tier
+      const tierMatch = wikitext.match(/\|\s*liquipediatier\s*=\s*([^\n|]+)/i);
+      if (tierMatch) {
+        tournamentData.tier = tierMatch[1].trim();
+      }
+
+      // Extract team number
+      const teamNumMatch = wikitext.match(/\|\s*team_number\s*=\s*([^\n|]+)/i);
+      if (teamNumMatch) {
+        tournamentData.team_number = parseInt(teamNumMatch[1].trim());
+      }
+
+      // Extract sponsors
+      const sponsorMatch = wikitext.match(/\|\s*sponsor\s*=\s*([^\n|]+)/i);
+      if (sponsorMatch) {
+        const sponsorText = sponsorMatch[1].trim();
+        // Parse sponsor links
+        const sponsorLinks = sponsorText.match(/\[https?:\/\/[^\s\]]+\s+([^\]]+)\]/g);
+        if (sponsorLinks) {
+          tournamentData.sponsors = sponsorLinks.map(link => 
+            link.replace(/\[https?:\/\/[^\s\]]+\s+([^\]]+)\]/, '$1')
+          );
+        }
+      }
+
+      // NEW: Extract teams from bracket templates
+      this.extractTeamsFromBrackets(wikitext, tournamentData);
+
+      // NEW: Extract match results from bracket templates
+      this.extractMatchesFromBrackets(wikitext, tournamentData);
+
+      // Fallback: Look for team templates in the wikitext
       const teamMatches = wikitext.match(/\{\{team\|([^}]+)\}\}/gi);
-      if (teamMatches) {
+      if (teamMatches && tournamentData.participants.length === 0) {
         tournamentData.participants = teamMatches
-          .map(match => match.replace(/\{\{team\|([^}]+)\}\}/i, '$1').trim())
+          .map(match => {
+            const teamName = match.replace(/\{\{team\|([^}|]+).*?\}\}/i, '$1').trim();
+            return teamName;
+          })
+          .filter((team, index, arr) => arr.indexOf(team) === index) // Remove duplicates
           .slice(0, 20); // Limit participants
       }
 
@@ -815,6 +1026,720 @@ class LiquipediaService {
     }
 
     return tournamentData;
+  }
+
+  // NEW: Extract teams from bracket templates
+  extractTeamsFromBrackets(wikitext, tournamentData) {
+    try {
+      // Look for bracket templates like {{Bracket/8U4L2DSL1D
+      const bracketMatch = wikitext.match(/\{\{Bracket\/[^}]+\}\}/gs);
+      if (bracketMatch) {
+        const bracketText = bracketMatch[0];
+        
+        // Extract team names from bracket parameters
+        const teamParams = bracketText.match(/\|R\d+D\d+team\d*=([^|\n}]+)/g);
+        if (teamParams) {
+          const teams = teamParams
+            .map(param => param.replace(/\|R\d+D\d+team\d*=/, '').trim())
+            .filter(team => team && !team.includes('{{') && team !== 'TBD')
+            .map(team => team.replace(/\[\[([^|\]]+).*?\]\]/, '$1')) // Remove wiki links
+            .filter((team, index, arr) => arr.indexOf(team) === index); // Remove duplicates
+          
+          tournamentData.participants.push(...teams);
+        }
+      }
+
+      // Also look for MatchList templates
+      const matchListMatch = wikitext.match(/\{\{MatchList[^}]*\|([^}]+)\}\}/gs);
+      if (matchListMatch) {
+        matchListMatch.forEach(match => {
+          const teamParams = match.match(/\|team\d*=([^|\n}]+)/g);
+          if (teamParams) {
+            const teams = teamParams
+              .map(param => param.replace(/\|team\d*=/, '').trim())
+              .filter(team => team && !team.includes('{{') && team !== 'TBD');
+            
+            tournamentData.participants.push(...teams);
+          }
+        });
+      }
+
+      // Remove duplicates
+      tournamentData.participants = [...new Set(tournamentData.participants)];
+      
+    } catch (error) {
+      logger.warn('Error extracting teams from brackets', error);
+    }
+  }
+
+  // NEW: Extract matches from bracket templates
+  extractMatchesFromBrackets(wikitext, tournamentData) {
+    try {
+      // Look for match results in bracket templates
+      const bracketMatch = wikitext.match(/\{\{Bracket\/[^}]+\}\}/gs);
+      if (bracketMatch) {
+        const bracketText = bracketMatch[0];
+        
+        // Extract match scores and details
+        const scoreParams = bracketText.match(/\|R\d+D\d+score\d*=([^|\n}]+)/g);
+        const winnerParams = bracketText.match(/\|R\d+D\d+win\d*=([^|\n}]+)/g);
+        
+        if (scoreParams && winnerParams) {
+          for (let i = 0; i < Math.min(scoreParams.length, winnerParams.length); i++) {
+            const score = scoreParams[i].replace(/\|R\d+D\d+score\d*=/, '').trim();
+            const winner = winnerParams[i].replace(/\|R\d+D\d+win\d*=/, '').trim();
+            
+            if (score && winner) {
+              tournamentData.matches.push({
+                round: `Round ${Math.floor(i / 2) + 1}`,
+                match_id: i + 1,
+                score: score,
+                winner: winner,
+                status: 'completed'
+              });
+            }
+          }
+        }
+      }
+
+      // Look for MatchMaps templates for detailed match info
+      const matchMapsRegex = /\{\{MatchMaps[^}]*\|([^}]+)\}\}/gs;
+      let matchMapMatch;
+      while ((matchMapMatch = matchMapsRegex.exec(wikitext)) !== null) {
+        const matchContent = matchMapMatch[1];
+        
+        // Extract team names and scores
+        const team1Match = matchContent.match(/\|team1=([^|\n}]+)/);
+        const team2Match = matchContent.match(/\|team2=([^|\n}]+)/);
+        const score1Match = matchContent.match(/\|score1=([^|\n}]+)/);
+        const score2Match = matchContent.match(/\|score2=([^|\n}]+)/);
+        const dateMatch = matchContent.match(/\|date=([^|\n}]+)/);
+        
+        if (team1Match && team2Match) {
+          const matchData = {
+            team1: team1Match[1].trim(),
+            team2: team2Match[1].trim(),
+            score1: score1Match ? score1Match[1].trim() : null,
+            score2: score2Match ? score2Match[1].trim() : null,
+            date: dateMatch ? dateMatch[1].trim() : null,
+            status: (score1Match && score2Match) ? 'completed' : 'scheduled'
+          };
+          
+          tournamentData.matches.push(matchData);
+        }
+      }
+      
+    } catch (error) {
+      logger.warn('Error extracting matches from brackets', error);
+    }
+  }
+
+  // NEW: Comprehensive tournament data fetching by tournament name
+  async fetchTournamentByName(tournamentName, game = 'counterstrike') {
+    logger.info(`Fetching comprehensive tournament data for: ${tournamentName} in ${game}`);
+    
+    try {
+      const tournamentData = {
+        tournament: null,
+        teams: [],
+        players: [],
+        matches: [],
+        brackets: null,
+        results: null,
+        status: 'unknown',
+        fetched_at: new Date().toISOString()
+      };
+
+      // 1. Fetch tournament details
+      tournamentData.tournament = await this.fetchTournamentDetails(tournamentName, game);
+      
+      if (!tournamentData.tournament) {
+        logger.warn(`Tournament ${tournamentName} not found in ${game}`);
+        return tournamentData;
+      }
+
+      // 2. Determine tournament status (ongoing/concluded)
+      const currentDate = new Date();
+      const tournamentInfo = tournamentData.tournament.parsed_data;
+      
+      if (tournamentInfo.dates.end) {
+        const endDate = new Date(tournamentInfo.dates.end);
+        tournamentData.status = endDate < currentDate ? 'concluded' : 'ongoing';
+      } else if (tournamentInfo.dates.start) {
+        const startDate = new Date(tournamentInfo.dates.start);
+        tournamentData.status = startDate > currentDate ? 'upcoming' : 'ongoing';
+      }
+
+      // 3. Fetch participating teams using multiple methods
+      tournamentData.teams = await this.fetchTournamentTeamsImproved(tournamentName, game, tournamentInfo.participants);
+
+      // 4. Fetch tournament matches
+      tournamentData.matches = await this.fetchTournamentMatchesDetailed(tournamentName, game);
+
+      // 5. Fetch brackets and results based on status
+      if (tournamentData.status === 'concluded') {
+        tournamentData.results = await this.fetchTournamentFinalResults(tournamentName, game);
+      } else {
+        tournamentData.brackets = await this.fetchTournamentBrackets(tournamentName, game);
+      }
+
+      // 6. Fetch players from participating teams
+      if (tournamentData.teams.length > 0) {
+        tournamentData.players = await this.fetchTournamentPlayers(tournamentData.teams, game);
+      }
+
+      logger.info(`Tournament data fetched: ${tournamentData.teams.length} teams, ${tournamentData.players.length} players, ${tournamentData.matches.length} matches`);
+      return tournamentData;
+
+    } catch (error) {
+      logger.error(`Failed to fetch tournament data for ${tournamentName}`, error);
+      throw error;
+    }
+  }
+
+  // Fetch teams participating in a tournament - IMPROVED
+  async fetchTournamentTeamsImproved(tournamentName, game, participantNames = []) {
+    logger.info(`Fetching tournament teams for ${tournamentName} in ${game}`);
+    
+    const teams = [];
+    
+    try {
+      // Method 1: Try LPDB to get tournament participants
+      const lpdbData = await this.makeRequest(`https://liquipedia.net/${game}/api.php`, {
+        action: 'cargoquery',
+        format: 'json',
+        tables: 'Tournaments',
+        fields: 'Tournaments.participants',
+        where: `Tournaments.pagename="${tournamentName.replace(/'/g, "''")}"`,
+        limit: 1
+      }, 0, 'lpdb');
+
+      if (lpdbData.cargoquery && lpdbData.cargoquery.length > 0) {
+        const participants = lpdbData.cargoquery[0].title.participants;
+        if (participants) {
+          logger.info(`Found participants from LPDB: ${participants}`);
+          // Parse participants list
+          const teamList = participants.split(',').map(t => t.trim()).filter(t => t);
+          participantNames.push(...teamList);
+        }
+      }
+
+      // Method 2: Try to get teams from tournament subpages
+      const subpageData = await this.makeRequest(`https://liquipedia.net/${game}/api.php`, {
+        action: 'query',
+        format: 'json',
+        list: 'allpages',
+        apprefix: tournamentName + '/',
+        apnamespace: 0,
+        aplimit: 20
+      });
+
+      const subpages = subpageData.query?.allpages || [];
+      
+      // Look for participant/team list pages
+      const teamPages = subpages.filter(page => {
+        const title = page.title.toLowerCase();
+        return title.includes('participant') || 
+               title.includes('team') ||
+               title.includes('qualifier') ||
+               title.includes('group');
+      });
+
+      // Extract teams from these pages
+      for (const teamPage of teamPages.slice(0, 3)) {
+        try {
+          const pageData = await this.makeRequest(`https://liquipedia.net/${game}/api.php`, {
+            action: 'parse',
+            format: 'json',
+            page: teamPage.title,
+            prop: 'wikitext'
+          }, 0, 'intensive');
+
+          if (pageData.parse && pageData.parse.wikitext) {
+            const wikitext = pageData.parse.wikitext['*'];
+            
+            // Extract team names from wikitext
+            const teamMatches = wikitext.match(/\{\{team\|([^}|]+)/gi);
+            if (teamMatches) {
+              const pageTeams = teamMatches.map(match => 
+                match.replace(/\{\{team\|([^}|]+).*/, '$1').trim()
+              );
+              participantNames.push(...pageTeams);
+            }
+
+            // Also look for TeamCard templates
+            const teamCardMatches = wikitext.match(/\{\{TeamCard[^}]*\|([^}|]+)/gi);
+            if (teamCardMatches) {
+              const cardTeams = teamCardMatches.map(match => 
+                match.replace(/\{\{TeamCard[^}]*\|([^}|]+).*/, '$1').trim()
+              );
+              participantNames.push(...cardTeams);
+            }
+          }
+
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        } catch (error) {
+          logger.warn(`Failed to fetch team page ${teamPage.title}`, error);
+        }
+      }
+
+      // Remove duplicates and clean up team names
+      const uniqueTeams = [...new Set(participantNames)]
+        .filter(team => team && team.length > 1 && !team.includes('{{'))
+        .slice(0, 16);
+
+      logger.info(`Found ${uniqueTeams.length} unique teams: ${uniqueTeams.join(', ')}`);
+
+      // Method 3: Fetch basic team info for each team
+      for (const teamName of uniqueTeams) {
+        try {
+          // Create basic team object without full details to avoid rate limiting
+          const basicTeam = {
+            id: teamName.replace(/[^a-zA-Z0-9]/g, '_'),
+            name: teamName,
+            game: game,
+            status: 'unknown',
+            roster: [],
+            country: null,
+            tournament_participant: true,
+            liquipedia_url: `https://liquipedia.net/${game}/${encodeURIComponent(teamName.replace(/ /g, '_'))}`
+          };
+
+          teams.push(basicTeam);
+          
+        } catch (error) {
+          logger.warn(`Failed to create team object for ${teamName}`, error);
+        }
+      }
+
+      logger.info(`Returning ${teams.length} teams for tournament ${tournamentName}`);
+      return teams;
+
+    } catch (error) {
+      logger.error(`Failed to fetch tournament teams for ${tournamentName}`, error);
+      return [];
+    }
+  }
+
+  // Fetch teams participating in a tournament (legacy method)
+  async fetchTournamentTeams(participantNames, game) {
+    logger.info(`Fetching ${participantNames.length} tournament teams for ${game}`);
+    
+    const teams = [];
+    
+    for (const teamName of participantNames.slice(0, 16)) { // Limit to 16 teams
+      try {
+        const teamData = await this.fetchTeamDetails(teamName, game);
+        if (teamData) {
+          teams.push(teamData);
+        }
+        
+        // Rate limiting delay
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      } catch (error) {
+        logger.warn(`Failed to fetch team details for ${teamName}`, error);
+      }
+    }
+    
+    return teams;
+  }
+
+  // Fetch team details by name
+  async fetchTeamDetails(teamName, game) {
+    try {
+      const data = await this.makeRequest(`https://liquipedia.net/${game}/api.php`, {
+        action: 'parse',
+        format: 'json',
+        page: teamName,
+        prop: 'wikitext|categories'
+      }, 0, 'intensive');
+
+      if (data.parse && data.parse.wikitext) {
+        const wikitext = data.parse.wikitext['*'];
+        const categories = data.parse.categories || [];
+        
+        return {
+          id: teamName.replace(/ /g, '_'),
+          name: teamName,
+          game: game,
+          status: this.determineTeamStatus(categories),
+          roster: this.extractTeamRoster(wikitext),
+          country: this.extractTeamCountry(wikitext),
+          liquipedia_url: `https://liquipedia.net/${game}/${encodeURIComponent(teamName.replace(/ /g, '_'))}`
+        };
+      }
+      
+      return null;
+    } catch (error) {
+      logger.error(`Failed to fetch team details for ${teamName}`, error);
+      return null;
+    }
+  }
+
+  // Extract team roster from wikitext
+  extractTeamRoster(wikitext) {
+    const roster = [];
+    
+    try {
+      // Look for player templates in roster section
+      const rosterSection = wikitext.match(/==\s*roster\s*==(.*?)(?===|$)/is);
+      if (rosterSection) {
+        const playerMatches = rosterSection[1].match(/\{\{player\|([^}]+)\}\}/gi);
+        if (playerMatches) {
+          roster.push(...playerMatches.map(match => 
+            match.replace(/\{\{player\|([^}|]+).*?\}\}/i, '$1').trim()
+          ));
+        }
+      }
+    } catch (error) {
+      logger.warn('Error extracting team roster', error);
+    }
+    
+    return roster.slice(0, 10); // Limit to 10 players
+  }
+
+  // Extract team country from wikitext
+  extractTeamCountry(wikitext) {
+    try {
+      const countryMatch = wikitext.match(/\|\s*country\s*=\s*([^\n|]+)/i);
+      return countryMatch ? countryMatch[1].trim() : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  // Determine team status from categories
+  determineTeamStatus(categories) {
+    const categoryNames = categories.map(cat => cat['*'].toLowerCase());
+    
+    if (categoryNames.some(cat => cat.includes('active'))) return 'active';
+    if (categoryNames.some(cat => cat.includes('inactive'))) return 'inactive';
+    if (categoryNames.some(cat => cat.includes('disbanded'))) return 'disbanded';
+    
+    return 'unknown';
+  }
+
+  // Fetch tournament matches with details - IMPROVED
+  async fetchTournamentMatchesDetailed(tournamentName, game) {
+    logger.info(`Fetching detailed matches for tournament: ${tournamentName}`);
+    
+    try {
+      const matches = [];
+      
+      // Method 1: Try to get matches from tournament subpages
+      const subpageData = await this.makeRequest(`https://liquipedia.net/${game}/api.php`, {
+        action: 'query',
+        format: 'json',
+        list: 'allpages',
+        apprefix: tournamentName + '/',
+        apnamespace: 0,
+        aplimit: 50
+      });
+
+      const subpages = subpageData.query?.allpages || [];
+      logger.info(`Found ${subpages.length} subpages for ${tournamentName}`);
+      
+      // Look for bracket/match subpages
+      const matchSubpages = subpages.filter(page => {
+        const title = page.title.toLowerCase();
+        return title.includes('bracket') || 
+               title.includes('playoff') || 
+               title.includes('group') ||
+               title.includes('stage') ||
+               title.includes('round') ||
+               title.includes('final') ||
+               (title.includes('vs') || title.includes('v.')) ||
+               title.includes('match');
+      });
+
+      // Fetch details for relevant subpages
+      for (const subpage of matchSubpages.slice(0, 10)) {
+        try {
+          const matchDetails = await this.fetchMatchDetails(subpage.title, game);
+          if (matchDetails) {
+            matches.push({
+              id: subpage.pageid,
+              title: subpage.title,
+              game: game,
+              tournament: tournamentName,
+              details: matchDetails,
+              type: 'tournament_subpage',
+              liquipedia_url: `https://liquipedia.net/${game}/${encodeURIComponent(subpage.title.replace(/ /g, '_'))}`
+            });
+          }
+          
+          // Rate limiting delay
+          await new Promise(resolve => setTimeout(resolve, 3000));
+        } catch (error) {
+          logger.warn(`Failed to fetch match details for ${subpage.title}`, error);
+        }
+      }
+
+      // Method 2: If no matches found, try LPDB query for matches
+      if (matches.length === 0) {
+        logger.info(`No matches found in subpages, trying LPDB query for ${tournamentName}`);
+        
+        try {
+          const lpdbData = await this.makeRequest(`https://liquipedia.net/${game}/api.php`, {
+            action: 'cargoquery',
+            format: 'json',
+            tables: 'Matches2',
+            fields: 'Matches2.pagename, Matches2.date, Matches2.opponent1, Matches2.opponent2, Matches2.winner, Matches2.score1, Matches2.score2',
+            where: `Matches2.tournament="${tournamentName.replace(/'/g, "''")}"`,
+            limit: 20,
+            order_by: 'Matches2.date DESC'
+          }, 0, 'lpdb');
+
+          if (lpdbData.cargoquery && lpdbData.cargoquery.length > 0) {
+            const lpdbMatches = lpdbData.cargoquery.map(item => {
+              const match = item.title;
+              return {
+                id: Math.random().toString(36).substr(2, 9),
+                title: match.pagename || `${match.opponent1} vs ${match.opponent2}`,
+                game: game,
+                tournament: tournamentName,
+                details: {
+                  teams: [match.opponent1, match.opponent2].filter(t => t),
+                  score: match.score1 && match.score2 ? `${match.score1}-${match.score2}` : null,
+                  date: match.date,
+                  winner: match.winner,
+                  tournament: tournamentName,
+                  game: game
+                },
+                type: 'lpdb_match',
+                liquipedia_url: match.pagename ? `https://liquipedia.net/${game}/${encodeURIComponent(match.pagename.replace(/ /g, '_'))}` : null
+              };
+            });
+            
+            matches.push(...lpdbMatches);
+            logger.info(`Found ${lpdbMatches.length} matches from LPDB for ${tournamentName}`);
+          }
+        } catch (error) {
+          logger.warn(`LPDB query failed for ${tournamentName}`, error);
+        }
+      }
+
+      // Method 3: If still no matches, search for match-like pages
+      if (matches.length === 0) {
+        const searchTerms = tournamentName.split('/').pop(); // Get last part of tournament name
+        const searchData = await this.makeRequest(`https://liquipedia.net/${game}/api.php`, {
+          action: 'query',
+          format: 'json',
+          list: 'search',
+          srsearch: `"${searchTerms}" (bracket OR playoff OR "group stage" OR final OR semifinal)`,
+          srnamespace: 0,
+          srlimit: 10
+        });
+
+        const searchResults = searchData.query?.search || [];
+        
+        for (const result of searchResults.slice(0, 5)) {
+          if (result.title.toLowerCase().includes(searchTerms.toLowerCase())) {
+            try {
+              const matchDetails = await this.fetchMatchDetails(result.title, game);
+              if (matchDetails) {
+                matches.push({
+                  id: result.pageid,
+                  title: result.title,
+                  game: game,
+                  tournament: tournamentName,
+                  details: matchDetails,
+                  type: 'search_result',
+                  liquipedia_url: `https://liquipedia.net/${game}/${encodeURIComponent(result.title.replace(/ /g, '_'))}`
+                });
+              }
+              
+              await new Promise(resolve => setTimeout(resolve, 3000));
+            } catch (error) {
+              logger.warn(`Failed to fetch search result details for ${result.title}`, error);
+            }
+          }
+        }
+      }
+
+      logger.info(`Total matches found for ${tournamentName}: ${matches.length}`);
+      return matches;
+      
+    } catch (error) {
+      logger.error(`Failed to fetch tournament matches for ${tournamentName}`, error);
+      return [];
+    }
+  }
+
+  // Fetch tournament brackets (for ongoing tournaments)
+  async fetchTournamentBrackets(tournamentName, game) {
+    logger.info(`Fetching brackets for ongoing tournament: ${tournamentName}`);
+    
+    try {
+      // Look for bracket subpages
+      const data = await this.makeRequest(`https://liquipedia.net/${game}/api.php`, {
+        action: 'query',
+        format: 'json',
+        list: 'search',
+        srsearch: `"${tournamentName}" AND (bracket OR playoffs OR main event)`,
+        srnamespace: 0,
+        srlimit: 10
+      });
+
+      const bracketPages = data.query?.search || [];
+      const brackets = [];
+      
+      for (const bracketPage of bracketPages.slice(0, 3)) {
+        try {
+          const bracketData = await this.fetchMatchDetails(bracketPage.title, game);
+          if (bracketData) {
+            brackets.push({
+              title: bracketPage.title,
+              data: bracketData,
+              type: 'bracket'
+            });
+          }
+          
+          await new Promise(resolve => setTimeout(resolve, 3000));
+        } catch (error) {
+          logger.warn(`Failed to fetch bracket ${bracketPage.title}`, error);
+        }
+      }
+      
+      return brackets;
+    } catch (error) {
+      logger.error(`Failed to fetch tournament brackets for ${tournamentName}`, error);
+      return [];
+    }
+  }
+
+  // Fetch tournament final results (for concluded tournaments)
+  async fetchTournamentFinalResults(tournamentName, game) {
+    logger.info(`Fetching final results for concluded tournament: ${tournamentName}`);
+    
+    try {
+      // Look for results/standings pages
+      const data = await this.makeRequest(`https://liquipedia.net/${game}/api.php`, {
+        action: 'query',
+        format: 'json',
+        list: 'search',
+        srsearch: `"${tournamentName}" AND (results OR standings OR final OR winner)`,
+        srnamespace: 0,
+        srlimit: 10
+      });
+
+      const resultPages = data.query?.search || [];
+      const results = [];
+      
+      for (const resultPage of resultPages.slice(0, 3)) {
+        try {
+          const resultData = await this.fetchMatchDetails(resultPage.title, game);
+          if (resultData) {
+            results.push({
+              title: resultPage.title,
+              data: resultData,
+              type: 'final_results'
+            });
+          }
+          
+          await new Promise(resolve => setTimeout(resolve, 3000));
+        } catch (error) {
+          logger.warn(`Failed to fetch results ${resultPage.title}`, error);
+        }
+      }
+      
+      return results;
+    } catch (error) {
+      logger.error(`Failed to fetch tournament results for ${tournamentName}`, error);
+      return [];
+    }
+  }
+
+  // Fetch players from tournament teams
+  async fetchTournamentPlayers(teams, game) {
+    logger.info(`Fetching players from ${teams.length} tournament teams`);
+    
+    const players = [];
+    
+    for (const team of teams.slice(0, 8)) { // Limit teams to prevent rate limiting
+      if (team.roster && team.roster.length > 0) {
+        for (const playerName of team.roster.slice(0, 5)) { // Limit players per team
+          try {
+            const playerData = await this.fetchPlayerDetails(playerName, game);
+            if (playerData) {
+              players.push({
+                ...playerData,
+                current_team: team.name
+              });
+            }
+            
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          } catch (error) {
+            logger.warn(`Failed to fetch player details for ${playerName}`, error);
+          }
+        }
+      }
+    }
+    
+    return players;
+  }
+
+  // Fetch player details by name
+  async fetchPlayerDetails(playerName, game) {
+    try {
+      const data = await this.makeRequest(`https://liquipedia.net/${game}/api.php`, {
+        action: 'parse',
+        format: 'json',
+        page: playerName,
+        prop: 'wikitext|categories'
+      }, 0, 'intensive');
+
+      if (data.parse && data.parse.wikitext) {
+        const wikitext = data.parse.wikitext['*'];
+        const categories = data.parse.categories || [];
+        
+        return {
+          id: playerName.replace(/ /g, '_'),
+          name: playerName,
+          game: game,
+          status: this.determinePlayerStatus(categories),
+          nationality: this.extractPlayerNationality(wikitext),
+          role: this.extractPlayerRole(wikitext),
+          liquipedia_url: `https://liquipedia.net/${game}/${encodeURIComponent(playerName.replace(/ /g, '_'))}`
+        };
+      }
+      
+      return null;
+    } catch (error) {
+      logger.error(`Failed to fetch player details for ${playerName}`, error);
+      return null;
+    }
+  }
+
+  // Extract player nationality from wikitext
+  extractPlayerNationality(wikitext) {
+    try {
+      const nationalityMatch = wikitext.match(/\|\s*nationality\s*=\s*([^\n|]+)/i);
+      return nationalityMatch ? nationalityMatch[1].trim() : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  // Extract player role from wikitext
+  extractPlayerRole(wikitext) {
+    try {
+      const roleMatch = wikitext.match(/\|\s*role\s*=\s*([^\n|]+)/i);
+      return roleMatch ? roleMatch[1].trim() : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  // Determine player status from categories
+  determinePlayerStatus(categories) {
+    const categoryNames = categories.map(cat => cat['*'].toLowerCase());
+    
+    if (categoryNames.some(cat => cat.includes('active'))) return 'active';
+    if (categoryNames.some(cat => cat.includes('retired'))) return 'retired';
+    if (categoryNames.some(cat => cat.includes('inactive'))) return 'inactive';
+    
+    return 'unknown';
   }
 }
 

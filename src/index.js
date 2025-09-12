@@ -49,56 +49,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Debug endpoint for testing tournament search
-app.get('/api/debug/tournament/:tournamentName', async (req, res) => {
-  try {
-    const { tournamentName } = req.params;
-    const { game = 'counterstrike' } = req.query;
-    
-    logger.info(`DEBUG: Testing tournament search for: ${tournamentName} in ${game}`);
-    
-    // Just test the search functionality without full tournament fetch
-    const searchTerms = tournamentName.split(' ').filter(term => term.length > 2);
-    const searchQuery = searchTerms.join(' ');
-    
-    const searchData = await liquipediaService.makeRequest(`https://liquipedia.net/${game}/api.php`, {
-      action: 'query',
-      format: 'json',
-      list: 'search',
-      srsearch: searchQuery,
-      srnamespace: 0,
-      srlimit: 10
-    });
 
-    const searchResults = searchData.query?.search || [];
-    
-    res.json({
-      success: true,
-      debug: true,
-      original_name: tournamentName,
-      search_query: searchQuery,
-      search_results: searchResults.map(r => ({
-        title: r.title,
-        snippet: r.snippet,
-        encoded_url: encodeURIComponent(r.title.replace(/ /g, '_'))
-      })),
-      liquipedia_url: `https://liquipedia.net/${game}/api.php`,
-      url_encoding_help: {
-        note: "Use these encoded URLs in your API calls",
-        example: `http://localhost:3000/api/tournament/${encodeURIComponent(searchResults[0]?.title || 'Tournament Name')}?game=${game}`
-      }
-    });
-    
-  } catch (error) {
-    logger.error(`DEBUG: Failed to search for tournament ${req.params.tournamentName}`, error);
-    res.status(500).json({ 
-      success: false,
-      debug: true,
-      error: error.message,
-      tournament: req.params.tournamentName
-    });
-  }
-});
 
 // URL encoding helper endpoint
 app.get('/api/encode/:text', (req, res) => {
@@ -111,69 +62,7 @@ app.get('/api/encode/:text', (req, res) => {
   });
 });
 
-// Test endpoint for improved parsing
-app.get('/api/test/tournament/:tournamentName', async (req, res) => {
-  try {
-    const { tournamentName } = req.params;
-    const { game = 'counterstrike' } = req.query;
-    
-    logger.info(`TEST: Fetching improved tournament data for: ${tournamentName} in ${game}`);
-    
-    // Test just the tournament details parsing
-    const tournamentDetails = await liquipediaService.fetchTournamentDetails(
-      decodeURIComponent(tournamentName), 
-      game
-    );
-    
-    if (!tournamentDetails) {
-      return res.status(404).json({
-        success: false,
-        message: 'Tournament not found',
-        tournament: tournamentName
-      });
-    }
-    
-    res.json({
-      success: true,
-      test_mode: true,
-      tournament: tournamentName,
-      game: game,
-      raw_data: {
-        found_name: tournamentDetails.found_name,
-        categories: tournamentDetails.categories,
-        wikitext_length: tournamentDetails.wikitext ? tournamentDetails.wikitext.length : 0,
-        has_html: !!tournamentDetails.html_snippet
-      },
-      extracted_data: {
-        basic_info: {
-          prize_pool: tournamentDetails.parsed_data.prize_pool,
-          organizer: tournamentDetails.parsed_data.organizer,
-          tier: tournamentDetails.parsed_data.tier,
-          team_count: tournamentDetails.parsed_data.team_number,
-          location: tournamentDetails.parsed_data.location,
-          dates: tournamentDetails.parsed_data.dates
-        },
-        teams: {
-          count: tournamentDetails.parsed_data.participants.length,
-          teams: tournamentDetails.parsed_data.participants.slice(0, 10)
-        },
-        matches: {
-          count: tournamentDetails.parsed_data.matches.length,
-          matches: tournamentDetails.parsed_data.matches.slice(0, 5)
-        }
-      }
-    });
-    
-  } catch (error) {
-    logger.error(`TEST: Failed to fetch tournament ${req.params.tournamentName}`, error);
-    res.status(500).json({ 
-      success: false,
-      test_mode: true,
-      error: error.message,
-      tournament: req.params.tournamentName
-    });
-  }
-});
+
 
 // Get teams from database
 app.get('/api/teams', async (req, res) => {
